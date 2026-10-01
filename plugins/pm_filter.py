@@ -45,6 +45,94 @@ def set_cached_search(key: str, data):
     import time
     SEARCH_CACHE[key] = (data, time.time())
 
+
+async def auto_spell_check_search(client, message):
+    """Try to recover a movie from a misspelled request without replying
+    when no matching movie exists in the bot database.
+
+    IMDb is used only to generate likely title candidates; a result is shown
+    only after the corrected title is found in the bot's own file database.
+    """
+    try:
+        original = (message.text or "").strip()
+        if not original:
+            return False
+
+        # Remove common request words before asking IMDb for candidates.
+        query = re.sub(
+            r"\b(pl(i|e)*?(s|z+|ease|se|ese|(e+)s(e)?)|"
+            r"((send|snd|giv(e)?|gib)(\sme)?)|movie(s)?|new|latest|"
+            r"br((o|u)h?)*|^h(e|a)?(l)*(o)*|mal(ayalam)?|t(h)?amil|"
+            r"file|that|find|und(o)*|kit(t(i|y)?)?o(w)?|thar(u)?(o)*|"
+            r"kittum(o)*|aya(k)*(um(o)*)?|full\smovie|any(one)|"
+            r"with\ssubtitle(s)?)",
+            "", original, flags=re.IGNORECASE
+        ).strip()
+        if not query:
+            return False
+
+        movies = await get_poster(query, bulk=True)
+        if not movies:
+            return False
+
+        # Try the most relevant IMDb candidates first.
+        seen = set()
+        for movie in movies[:10]:
+            title = (movie.get("title") or "").strip()
+            if not title:
+                continue
+            key = title.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            files, offset, total_results = await get_search_results(
+                title, offset=0, filter=True
+            )
+            if files:
+                # Tell the user exactly which film was detected, then reuse
+                # the normal result renderer so all existing buttons/settings
+                # continue to work unchanged.
+                await message.reply_text(
+                    f"🔎 <b>Did you mean:</b> <i>{title}</i>?",
+                    parse_mode=enums.ParseMode.HTML,
+                    quote=True,
+                )
+                await auto_ffilter(
+                    client, message,
+                    (title, files, offset, total_results)
+                )
+                logger.info("Spell check matched '%s' -> '%s'", original, title)
+                return True
+
+            # If IMDb supplied a year, try title + year as well.
+            year = movie.get("year")
+            if year:
+                files, offset, total_results = await get_search_results(
+                    f"{title} {year}", offset=0, filter=True
+                )
+                if files:
+                    corrected_title = f"{title} {year}"
+                    await message.reply_text(
+                        f"🔎 <b>Did you mean:</b> <i>{corrected_title}</i>?",
+                        parse_mode=enums.ParseMode.HTML,
+                        quote=True,
+                    )
+                    await auto_ffilter(
+                        client, message,
+                        (corrected_title, files, offset, total_results)
+                    )
+                    logger.info(
+                        "Spell check matched '%s' -> '%s %s'",
+                        original, title, year
+                    )
+                    return True
+    except Exception as e:
+        logger.exception("Auto spell check failed: %s", e)
+
+    return False
+
+
 @Client.on_message(filters.text & filters.incoming)
 async def give_filter(client, message):
     await auto_ffilter(client, message)
@@ -871,6 +959,13 @@ async def auto_ffilter(client, msg, spoll=False):
             search = message.text
             files, offset, total_results = await get_search_results(search, offset=0, filter=True)
             if not files:
+                # First try automatic spelling correction. It replies only when
+                # a corrected title is actually present in our database.
+                if SPELL_CHECK_REPLY:
+                    corrected = await auto_spell_check_search(client, message)
+                    if corrected:
+                        return
+
                 # No database result: silently check whether this is a Kannada movie
                 # that is actually available on an OTT platform. Never reply to the user.
                 schedule_ott_check(client, search, msg.from_user)
@@ -878,7 +973,12 @@ async def auto_ffilter(client, msg, spoll=False):
         else:
             return
     else:
-        message = msg.message.reply_to_message
+        # Callback-query spell-check flow uses the replied-to message;
+        # automatic spell-check can pass the original Message directly.
+        if hasattr(msg, "message") and getattr(msg.message, "reply_to_message", None):
+            message = msg.message.reply_to_message
+        else:
+            message = msg
         search, files, offset, total_results = spoll
         settings = await get_settings(message.chat.id)
     temp.SEND_ALL_TEMP[message.from_user.id] = files
@@ -940,7 +1040,7 @@ async def auto_ffilter(client, msg, spoll=False):
     else:
         await message.reply_photo(photo=NOR_IMG, caption=cap, reply_markup=InlineKeyboardMarkup(btn))
 
-    if spoll:
+    if spoll and hasattr(msg, "message"):
         await msg.message.delete()
 
 async def advantage_spell_chok(client, message):
