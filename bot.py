@@ -113,7 +113,9 @@ class Bot(Client):
         client = webserver.AppRunner(await bot_run())
         await client.setup()
         bind_address = "0.0.0.0"
-        await webserver.TCPSite(client, bind_address, 8080).start()
+        port = int(environ.get("PORT", "8000"))
+        await webserver.TCPSite(client, bind_address, port).start()
+        logging.info(f"🌐 Health server started on {bind_address}:{port}")
 
     async def stop(self, *args):
         await super().stop()
